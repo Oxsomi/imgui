@@ -20,6 +20,7 @@
 
 // CHANGELOG
 // (minor and older changes stripped away, please see git history for details)
+//  2025-08-12: Fixed root signature creation with the Agility SDK (if IMGUI_D3D12_USE_AGILITY_SDK is used and include dirs are correctly managed).
 //  2025-06-19: Fixed build on MinGW. (#8702, #4594)
 //  2025-06-11: DirectX12: Added support for ImGuiBackendFlags_RendererHasTextures, for dynamic font atlas.
 //  2025-05-07: DirectX12: Honor draw_data->FramebufferScale to allow for custom backends and experiment using it (consistently with other renderer backends, even though in normal condition it is not set under Windows).
@@ -61,6 +62,8 @@
 #ifdef _MSC_VER
 #pragma comment(lib, "d3dcompiler") // Automatically link with d3dcompiler.lib as we are using D3DCompile() below.
 #endif
+
+#include <wrl/client.h>
 
 // Clang/GCC warnings with -Weverything
 #if defined(__clang__)
@@ -604,38 +607,78 @@ bool    ImGui_ImplDX12_CreateDeviceObjects()
             D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
             D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
 
-        // Load d3d12.dll and D3D12SerializeRootSignature() function address dynamically to facilitate using with D3D12On7.
-        // See if any version of d3d12.dll is already loaded in the process. If so, give preference to that.
-        static HINSTANCE d3d12_dll = ::GetModuleHandleA("d3d12.dll");
-        if (d3d12_dll == nullptr)
+        using Microsoft::WRL::ComPtr;
+
+#ifdef IMGUI_D3D12_USE_AGILITY_SDK
+
+        // Agility SDK provides newer SDK features, but requires the root signature to be called on
+        // the device (config).
+
+        ComPtr<ID3D12DeviceConfiguration1> deviceConfig;
+        bd->pd3dDevice->QueryInterface(IID_PPV_ARGS(&deviceConfig));
+
+        if (deviceConfig.Get())
         {
-            // Attempt to load d3d12.dll from local directories. This will only succeed if
-            // (1) the current OS is Windows 7, and
-            // (2) there exists a version of d3d12.dll for Windows 7 (D3D12On7) in one of the following directories.
-            // See https://github.com/ocornut/imgui/pull/3696 for details.
-            const char* localD3d12Paths[] = { ".\\d3d12.dll", ".\\d3d12on7\\d3d12.dll", ".\\12on7\\d3d12.dll" }; // A. current directory, B. used by some games, C. used in Microsoft D3D12On7 sample
-            for (int i = 0; i < IM_ARRAYSIZE(localD3d12Paths); i++)
-                if ((d3d12_dll = ::LoadLibraryA(localD3d12Paths[i])) != nullptr)
-                    break;
 
-            // If failed, we are on Windows >= 10.
-            if (d3d12_dll == nullptr)
-                d3d12_dll = ::LoadLibraryA("d3d12.dll");
+            D3D12_VERSIONED_ROOT_SIGNATURE_DESC versionedDesc{ D3D_ROOT_SIGNATURE_VERSION_1_0 };
+            versionedDesc.Desc_1_0 = desc;
 
-            if (d3d12_dll == nullptr)
+            ComPtr<ID3DBlob> blob;
+            HRESULT result = deviceConfig->SerializeVersionedRootSignature(
+                &versionedDesc, blob.GetAddressOf(), nullptr
+            );
+
+            if (FAILED(result))
+                return false;
+
+            result = bd->pd3dDevice->CreateRootSignature(
+                0, blob->GetBufferPointer(), blob->GetBufferSize(),
+                IID_PPV_ARGS(&bd->pRootSignature)
+            );
+
+            if (FAILED(result))
                 return false;
         }
 
-        _PFN_D3D12_SERIALIZE_ROOT_SIGNATURE D3D12SerializeRootSignatureFn = (_PFN_D3D12_SERIALIZE_ROOT_SIGNATURE)(void*)::GetProcAddress(d3d12_dll, "D3D12SerializeRootSignature");
-        if (D3D12SerializeRootSignatureFn == nullptr)
-            return false;
+        else
+#endif
+        {
+            // Load d3d12.dll and D3D12SerializeRootSignature() function address dynamically to facilitate using with D3D12On7.
+            // See if any version of d3d12.dll is already loaded in the process. If so, give preference to that.
+            static HINSTANCE d3d12_dll = ::GetModuleHandleA("d3d12.dll");
 
-        ID3DBlob* blob = nullptr;
-        if (D3D12SerializeRootSignatureFn(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr) != S_OK)
-            return false;
+            if (d3d12_dll == nullptr)
+            {
+                // Attempt to load d3d12.dll from local directories. This will only succeed if
+                // (1) the current OS is Windows 7, and
+                // (2) there exists a version of d3d12.dll for Windows 7 (D3D12On7) in one of the following directories.
+                // See https://github.com/ocornut/imgui/pull/3696 for details.
+                const char* localD3d12Paths[] = { ".\\d3d12.dll", ".\\d3d12on7\\d3d12.dll", ".\\12on7\\d3d12.dll" }; // A. current directory, B. used by some games, C. used in Microsoft D3D12On7 sample
+                for (int i = 0; i < IM_ARRAYSIZE(localD3d12Paths); i++)
+                    if ((d3d12_dll = ::LoadLibraryA(localD3d12Paths[i])) != nullptr)
+                        break;
 
-        bd->pd3dDevice->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&bd->pRootSignature));
-        blob->Release();
+                // If failed, we are on Windows >= 10.
+                if (d3d12_dll == nullptr)
+                    d3d12_dll = ::LoadLibraryA("d3d12.dll");
+
+                if (d3d12_dll == nullptr)
+                    return false;
+            }
+
+            _PFN_D3D12_SERIALIZE_ROOT_SIGNATURE D3D12SerializeRootSignatureFn = (_PFN_D3D12_SERIALIZE_ROOT_SIGNATURE)(void*)::GetProcAddress(d3d12_dll, "D3D12SerializeRootSignature");
+            if (D3D12SerializeRootSignatureFn == nullptr)
+                return false;
+
+            ComPtr<ID3DBlob> blob;
+            if (D3D12SerializeRootSignatureFn(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr) != S_OK)
+                return false;
+
+            HRESULT result = bd->pd3dDevice->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&bd->pRootSignature));
+
+            if (FAILED(result))
+                return false;
+        }
     }
 
     // By using D3DCompile() from <d3dcompiler.h> / d3dcompiler.lib, we introduce a dependency to a given version of d3dcompiler_XX.dll (see D3DCOMPILER_DLL_A)
